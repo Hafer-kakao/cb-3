@@ -131,7 +131,7 @@ pub enum C1Token {
     #[regex(r"[ \t\f]+", logos::skip)]
     Whitespace,
 
-    #[regex(r"[\n]")]
+    #[regex(r"(\r\n|\r|\n)")]
     Linebreak,
 
     // Logos requires one token variant to handle errors,
@@ -140,45 +140,13 @@ pub enum C1Token {
     Error,
 }
 
-/// # Overview
-/// Extended lexer based on the logos crate. The lexer keeps track of the current token and the next token
-/// in the lexed text. Furthermore, the lexer keeps track of the line number in which each token is
-/// located, and of the text associated with each token.
-///
-/// # Examples
-/// ```
-/// use cb_3::C1Lexer;
-/// use cb_3::C1Token;
-///     
-/// let mut lexer = C1Lexer::new("void main() {
-///                                 x = 4;
-///                               }");
-/// assert_eq!(lexer.current_token(), Some(C1Token::KwVoid));
-/// assert_eq!(lexer.current_line_number(), Some(1));
-/// assert_eq!(lexer.peek_token(), Some(C1Token::Identifier));
-/// assert_eq!(lexer.peek_line_number(), Some(1));
-///
-/// lexer.eat();
-/// // current token is 'main'
-///
-/// lexer.eat();
-/// lexer.eat();
-/// lexer.eat();
-/// // current token is '{'
-///
-/// assert_eq!(lexer.current_token(), Some(C1Token::LeftBrace));
-/// assert_eq!(lexer.current_line_number(), Some(1));
-///
-/// // next token is 'x'
-/// assert_eq!(lexer.peek_token(), Some(C1Token::Identifier));
-/// assert_eq!(lexer.peek_text(), Some("x"));
-/// assert_eq!(lexer.peek_line_number(), Some(2));
-/// ```
 pub struct C1Lexer<'a> {
     logos_lexer: Lexer<'a, C1Token>,
     logos_line_number: usize,
     current_token: Option<TokenData<'a>>,
-    peek_token: Option<TokenData<'a>>,
+    past: Vec<TokenData<'a>>,
+    marks: usize,
+    position: usize,
 }
 
 impl<'a> C1Lexer<'a> {
@@ -188,10 +156,11 @@ impl<'a> C1Lexer<'a> {
             logos_lexer: C1Token::lexer(text),
             logos_line_number: 1,
             current_token: None,
-            peek_token: None,
+            past: vec![],
+            marks: 0,
+            position: 0,
         };
-        lexer.current_token = lexer.next_token();
-        lexer.peek_token = lexer.next_token();
+        lexer.advance();
         lexer
     }
 
@@ -210,92 +179,86 @@ impl<'a> C1Lexer<'a> {
         self.current_token.token_type()
     }
 
-    /// Return the C1Token variant of the next token without consuming it.
-    ///```
-    /// use cb_3::{C1Lexer, C1Token};
-    /// let lexer = C1Lexer::new("current next");
-    ///
-    /// assert_eq!(lexer.peek_token(), Some(C1Token::Identifier));
-    /// assert_eq!(lexer.peek_text(), Some("next"));
-    ///
-    /// assert_eq!(lexer.peek_token(), Some(C1Token::Identifier));
-    /// assert_eq!(lexer.peek_text(), Some("next"));
-    /// ```
-    pub fn peek_token(&self) -> Option<C1Token> {
-        self.peek_token.token_type()
-    }
-
     /// Return the text of the current token
     pub fn current_text(&self) -> Option<&str> {
         self.current_token.text()
     }
 
-    /// Return the text of the next token
-    pub fn peek_text(&self) -> Option<&str> {
-        self.peek_token.text()
-    }
 
     /// Return the line number where the current token is located
     pub fn current_line_number(&self) -> Option<usize> {
         self.current_token.line_number()
     }
 
-    /// Return the line number where the next token is located
-    pub fn peek_line_number(&self) -> Option<usize> {
-        self.peek_token.line_number()
+    pub fn mark(&mut self) -> usize {
+        self.marks += 1;
+        if self.marks == 1 {
+            if let Some(t) = self.current_token {
+                self.past = vec!(t);
+                self.position = 1;
+            }
+        } 
+        self.position-1
     }
 
-    /// Drop the current token and retrieve the next token in the text.
-    /// ```
-    /// use cb_3::{C1Lexer, C1Token};
-    /// let mut lexer = C1Lexer::new("current next last");
-    ///
-    /// assert_eq!(lexer.current_text(), Some("current"));
-    /// assert_eq!(lexer.peek_text(), Some("next"));
-    ///
-    /// lexer.eat();
-    /// assert_eq!(lexer.current_text(), Some("next"));
-    /// assert_eq!(lexer.peek_text(), Some("last"));
-    ///
-    /// lexer.eat();
-    /// assert_eq!(lexer.current_text(), Some("last"));
-    /// assert_eq!(lexer.peek_text(), None);
-    ///
-    /// lexer.eat();
-    /// assert_eq!(lexer.current_text(), None);
-    /// assert_eq!(lexer.peek_text(), None);
-    /// ```
-    pub fn eat(&mut self) {
-        self.current_token = self.peek_token.take();
-        self.peek_token = self.next_token();
+    pub fn undo(&mut self, marker: usize) {
+        self.position = marker;
+        self.advance();
     }
 
-    /// Private method for reading the next token from the logos::Lexer and extracting the required data
-    /// from it
-    fn next_token(&mut self) -> Option<TokenData<'a>> {
-        // Retrieve the next token from the internal lexer
+    pub fn pop_mark(&mut self) {
+        self.marks -= 1;
+    }
+
+    pub fn advance(&mut self)  {
+        let next;
+        if self.position >= self.past.len() {
+            next = self.next_token_lexer();
+        } else {
+            next = Some(self.past[self.position]);
+            self.position += 1;
+        }
+
+        if self.marks == 0 && self.position >= self.past.len() && self.past.len() != 0 {
+            self.past = vec![];
+            self.position = 0;
+        }
+
+        self.current_token = next;
+    }
+
+    fn next_token_lexer(&mut self) -> Option<TokenData<'a>> {
         if let Some(c1_token) = self.logos_lexer.next() {
             match c1_token {
                 C1Token::Linebreak => {
-                    // If the token is a linebreak, increase the line number and get the next token
                     self.logos_line_number += 1;
-                    self.next_token()
+                    self.next_token_lexer()
                 }
-                _ => Some(TokenData {
-                    // If the token is not a linebreak, initialize and return a TokenData instance
-                    token_type: c1_token,
-                    token_text: self.logos_lexer.slice(),
-                    token_line: self.logos_line_number,
-                }),
+                _ => {
+                    let next= TokenData {
+                        token_type: c1_token,
+                        token_text: self.logos_lexer.slice(),
+                        token_line: self.logos_line_number
+                    };
+                    
+                    if self.marks > 0 {
+                        self.past.push(next);
+                    }
+                    self.position = self.past.len();
+                    Some(next)
+                },
             }
         } else {
+            self.position = self.past.len() + 1;
             None
         }
     }
+
 }
 
 /// Hidden struct for capsuling the data associated with a token.
-struct TokenData<'a> {
+#[derive(Copy, Clone, Debug)]
+pub struct TokenData<'a> {
     token_type: C1Token,
     token_text: &'a str,
     token_line: usize,
@@ -323,65 +286,5 @@ impl<'a> TokenDataProvider<'a> for Option<TokenData<'a>> {
 
     fn line_number(&self) -> Option<usize> {
         self.as_ref().map(|data| data.token_line)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::lexer::C1Lexer;
-    use crate::C1Token;
-
-    #[test]
-    fn lines_are_counted() {
-        let mut lexer1 = C1Lexer::new("Hello\nTest");
-        assert_eq!(lexer1.current_line_number(), Some(1));
-        assert_eq!(lexer1.peek_line_number(), Some(2));
-        lexer1.eat();
-        assert_eq!(lexer1.current_line_number(), Some(2));
-        assert_eq!(lexer1.peek_line_number(), None);
-        lexer1.eat();
-        assert_eq!(lexer1.current_line_number(), None);
-        assert_eq!(lexer1.peek_line_number(), None);
-    }
-
-    #[test]
-    fn line_count_is_reset() {
-        {
-            let mut lexer1 = C1Lexer::new("Hello\nTest\nbla\nfoo");
-            lexer1.eat();
-            lexer1.eat();
-            assert_eq!(lexer1.current_line_number(), Some(3));
-            assert_eq!(lexer1.peek_line_number(), Some(4));
-        }
-        let lexer2 = C1Lexer::new("bool foo()");
-        assert_eq!(lexer2.current_line_number(), Some(1));
-        assert_eq!(lexer2.peek_line_number(), Some(1));
-    }
-
-    #[test]
-    fn float_recognition() {
-        let lexer = C1Lexer::new("1.2");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
-
-        let lexer = C1Lexer::new("1.000");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
-
-        let lexer = C1Lexer::new(".2");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
-
-        let lexer = C1Lexer::new("1.2e4");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
-
-        let lexer = C1Lexer::new("1.2e+4");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
-
-        let lexer = C1Lexer::new("1.2e-10");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
-
-        let lexer = C1Lexer::new("1.2E-10");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
-
-        let lexer = C1Lexer::new("33E+2");
-        assert_eq!(lexer.current_token(), Some(C1Token::ConstFloat));
     }
 }
